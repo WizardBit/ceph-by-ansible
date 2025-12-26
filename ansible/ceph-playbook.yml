@@ -1,0 +1,869 @@
+---
+###############################################################################
+# Ceph Classic Deployment Using OS packages (RBD + RGW + CephFS)
+# Cross-platform: Debian-family + RHEL-family
+###############################################################################
+
+###############################################################################
+# Install Ceph packages on all nodes
+###############################################################################
+- name: Install Ceph packages on all nodes
+  hosts: all
+  become: yes
+  gather_facts: true
+
+  vars:
+    chrony_service: "{{ 'chrony' if ansible_os_family == 'Debian' else 'chronyd' }}"
+
+    base_pkgs_debian:
+      - lvm2
+      - chrony
+      - python3-packaging
+
+    base_pkgs_redhat:
+      - lvm2
+      - chrony
+      - python3-packaging
+
+    ceph_common_pkgs:
+      - ceph-common
+
+    ceph_mon_pkgs:
+      - ceph-mon
+      - ceph-base
+
+    ceph_mgr_pkgs:
+      - ceph-mgr
+
+    ceph_osd_pkgs_debian:
+      - ceph-osd
+
+    ceph_osd_pkgs_redhat:
+      - ceph-osd
+      - ceph-volume
+
+    ceph_rgw_pkgs_debian:
+      - radosgw
+
+    ceph_rgw_pkgs_redhat:
+      - ceph-radosgw
+
+    ceph_mds_pkgs:
+      - ceph-mds
+
+  tasks:
+    - name: Update APT cache (Debian)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Refresh DNF cache (RHEL)
+      dnf:
+        update_cache: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: Select Ceph repo package for RHEL major version
+      set_fact:
+        ceph_repo_pkg: >-
+          {{ 'centos-release-ceph-quincy'
+             if (ansible_distribution_major_version | int) == 9
+             else 'centos-release-ceph-squid' }}
+      when: ansible_os_family == "RedHat"
+
+    - name: Install RHEL Ceph repo package (RHEL 9=quincy, RHEL 10=squid)
+      package:
+        name: "{{ ceph_repo_pkg }}"
+        state: present
+      when:
+        - ansible_os_family == "RedHat"
+        - (ansible_distribution_major_version | int) in [9, 10]
+      failed_when: false
+      changed_when: false
+
+    - name: Fail if unsupported RHEL major version for Ceph repo selection
+      fail:
+        msg: "Unsupported RHEL-family major version={{ ansible_distribution_major_version }} (expected 9 or 10)."
+      when:
+        - ansible_os_family == "RedHat"
+        - (ansible_distribution_major_version | int) not in [9, 10]
+
+    - name: Install base packages
+      package:
+        name: "{{ base_pkgs_debian if ansible_os_family == 'Debian' else base_pkgs_redhat }}"
+        state: present
+
+    - name: Install ceph-common
+      package:
+        name: "{{ ceph_common_pkgs }}"
+        state: present
+
+    - name: Install MON packages
+      package:
+        name: "{{ ceph_mon_pkgs }}"
+        state: present
+      when: "'mon' in group_names"
+
+    - name: Install MGR packages
+      package:
+        name: "{{ ceph_mgr_pkgs }}"
+        state: present
+      when: "'mgr' in group_names"
+
+    - name: Install MDS packages (CephFS)
+      package:
+        name: "{{ ceph_mds_pkgs }}"
+        state: present
+      when: "'mds' in group_names"
+
+    - name: Install OSD packages
+      package:
+        name: "{{ ceph_osd_pkgs_debian if ansible_os_family == 'Debian' else ceph_osd_pkgs_redhat }}"
+        state: present
+      when: "'osd' in group_names"
+
+    - name: Install RGW packages
+      package:
+        name: "{{ ceph_rgw_pkgs_debian if ansible_os_family == 'Debian' else ceph_rgw_pkgs_redhat }}"
+        state: present
+      when: "'rgw' in group_names"
+
+    - name: Verify ceph-volume exists on OSD nodes
+      command: ceph-volume -h
+      register: ceph_volume_ver
+      changed_when: false
+      failed_when: false
+      when: "'osd' in group_names"
+
+    - name: Fail if ceph-volume missing
+      fail:
+        msg: |
+          ceph-volume not found on {{ inventory_hostname }}.
+          Verify Ceph repo enablement.
+      when: "'osd' in group_names and ceph_volume_ver.rc != 0"
+
+    - name: Enable and start chrony
+      systemd:
+        name: "{{ chrony_service }}"
+        enabled: yes
+        state: started
+
+
+###############################################################################
+# Generate a random cluster FSID
+###############################################################################
+- name: Generate cluster FSID
+  hosts: admin
+  become: yes
+  gather_facts: false
+
+  tasks:
+    - command: uuidgen
+      register: fsid_cmd
+      changed_when: false
+
+    - set_fact:
+        ceph_fsid: "{{ fsid_cmd.stdout | trim }}"
+      delegate_to: localhost
+      delegate_facts: true
+
+
+###############################################################################
+# Discover Ceph public/cluster network from admin node default interface
+###############################################################################
+- name: Discover ceph_public_network and ceph_cluster_network
+  hosts: admin
+  become: yes
+  gather_facts: true
+
+  tasks:
+    - name: Determine default IPv4 interface on admin
+      set_fact:
+        ceph_default_iface: "{{ ansible_default_ipv4.interface | default('') }}"
+
+    - name: Fail if default interface could not be determined
+      fail:
+        msg: "Could not determine ansible_default_ipv4.interface on admin. Ensure facts are available and admin has IPv4 default route."
+      when: ceph_default_iface | length == 0
+
+    - name: Pull CIDR from that interface facts (e.g. 10.3.0.12/21)
+      set_fact:
+        ceph_iface_cidr: >-
+          {{
+            (
+              hostvars[inventory_hostname]['ansible_' ~ ceph_default_iface].ipv4.address
+              ~ '/'
+              ~ hostvars[inventory_hostname]['ansible_' ~ ceph_default_iface].ipv4.prefix
+            )
+          }}
+
+    - name: Fail if CIDR could not be built
+      fail:
+        msg: "Could not build CIDR from interface={{ ceph_default_iface }} facts."
+      when: ceph_iface_cidr is not match('^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$')
+
+    - name: Compute network in CIDR (e.g. 10.3.0.0/21)
+      set_fact:
+        ceph_net_cidr: "{{ ceph_iface_cidr | ansible.utils.ipaddr('network/prefix') }}"
+
+    - name: Store Ceph network variables globally for later plays
+      set_fact:
+        ceph_public_network: "{{ ceph_net_cidr }}"
+        ceph_cluster_network: "{{ ceph_net_cidr }}"
+      delegate_to: localhost
+      delegate_facts: true
+
+    - name: Show computed networks
+      debug:
+        msg:
+          - "admin default iface={{ ceph_default_iface }}"
+          - "admin iface cidr={{ ceph_iface_cidr }}"
+          - "ceph_public_network={{ ceph_net_cidr }}"
+          - "ceph_cluster_network={{ ceph_net_cidr }}"
+
+
+###############################################################################
+# Build ceph.conf + keyrings + monmap on admin node
+###############################################################################
+- name: Build ceph.conf and bootstrap artifacts
+  hosts: admin
+  become: yes
+  gather_facts: true
+
+  vars:
+    ceph_cluster_name: ceph
+    ceph_fsid: "{{ hostvars['localhost'].ceph_fsid }}"
+
+    # CHANGE: derived from admin default interface (stored on localhost facts)
+    ceph_public_network: "{{ hostvars['localhost'].ceph_public_network }}"
+    ceph_cluster_network: "{{ hostvars['localhost'].ceph_cluster_network }}"
+
+    mon_members: "{{ groups['mon'] }}"
+    rgw_members: "{{ groups['rgw'] | default([]) }}"
+    mds_members: "{{ groups['mds'] | default([]) }}"
+    rgw_frontend_port: 80
+
+  tasks:
+    - name: Resolve MON IPs
+      shell: getent ahostsv4 {{ hostvars[item].ansible_host }} | awk 'NR==1{print $1}'
+      loop: "{{ mon_members }}"
+      register: mon_ips
+      changed_when: false
+
+    - set_fact:
+        mon_addr_map: "{{ mon_addr_map | default({}) | combine({ item.item: item.stdout }) }}"
+      loop: "{{ mon_ips.results }}"
+
+    - name: Resolve RGW IPs
+      shell: getent ahostsv4 {{ hostvars[item].ansible_host }} | awk 'NR==1{print $1}'
+      loop: "{{ rgw_members }}"
+      register: rgw_ips
+      changed_when: false
+      when: rgw_members | length > 0
+
+    - set_fact:
+        rgw_addr_map: "{{ rgw_addr_map | default({}) | combine({ item.item: item.stdout }) }}"
+      loop: "{{ rgw_ips.results | default([]) }}"
+      when: rgw_members | length > 0
+
+    - name: Create Ceph directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: ceph
+        group: ceph
+        mode: "0755"
+      loop:
+        - /etc/ceph
+        - /var/lib/ceph/bootstrap-osd
+        - /var/lib/ceph/bootstrap-rgw
+        - /var/lib/ceph/bootstrap-mds
+
+    - name: Render ceph.conf
+      copy:
+        dest: /etc/ceph/ceph.conf
+        owner: ceph
+        group: ceph
+        mode: "0644"
+        content: |
+          [global]
+          fsid = {{ ceph_fsid }}
+          public network = {{ ceph_public_network }}
+          cluster network = {{ ceph_cluster_network }}
+          mon initial members = {{ mon_members | join(',') }}
+          mon host = {{ mon_members | map('extract', mon_addr_map) | join(',') }}
+
+          {% for m in mon_members %}
+          [mon.{{ m }}]
+          host = {{ m }}
+          mon addr = {{ mon_addr_map[m] }}
+          {% endfor %}
+
+          {% if rgw_members | length > 0 %}
+          [client.rgw]
+          rgw frontends = beast port={{ rgw_frontend_port }}
+
+          {% for r in rgw_members %}
+          [client.rgw.{{ r }}]
+          rgw host = {{ rgw_addr_map[r] }}
+          rgw frontends = beast port={{ rgw_frontend_port }}
+          {% endfor %}
+          {% endif %}
+
+    - name: Create MON keyring
+      command: ceph-authtool --create-keyring /etc/ceph/ceph.mon.keyring --gen-key -n mon. --cap mon 'allow *'
+      args:
+        creates: /etc/ceph/ceph.mon.keyring
+
+    - name: Create admin keyring (includes MDS cap)
+      command: >
+        ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring
+        --gen-key -n client.admin
+        --cap mon 'allow *'
+        --cap osd 'allow *'
+        --cap mgr 'allow *'
+        --cap mds 'allow *'
+      args:
+        creates: /etc/ceph/ceph.client.admin.keyring
+
+    - name: Create bootstrap keyrings (osd/rgw/mds)
+      command: ceph-authtool --create-keyring {{ item.path }} --gen-key -n {{ item.name }} --cap mon '{{ item.cap }}' --cap mgr 'allow r'
+      loop:
+        - { path: /var/lib/ceph/bootstrap-osd/ceph.keyring, name: client.bootstrap-osd, cap: "profile bootstrap-osd" }
+        - { path: /var/lib/ceph/bootstrap-rgw/ceph.keyring, name: client.bootstrap-rgw, cap: "profile bootstrap-rgw" }
+        - { path: /var/lib/ceph/bootstrap-mds/ceph.keyring, name: client.bootstrap-mds, cap: "profile bootstrap-mds" }
+      args:
+        creates: "{{ item.path }}"
+
+    - name: Import keys into MON keyring
+      command: ceph-authtool /etc/ceph/ceph.mon.keyring --import-keyring {{ item }}
+      loop:
+        - /etc/ceph/ceph.client.admin.keyring
+        - /var/lib/ceph/bootstrap-osd/ceph.keyring
+        - /var/lib/ceph/bootstrap-rgw/ceph.keyring
+        - /var/lib/ceph/bootstrap-mds/ceph.keyring
+
+    - name: Create monmap
+      command: >
+        monmaptool --create
+        {% for m in mon_members %} --add {{ m }} {{ mon_addr_map[m] }} {% endfor %}
+        --fsid {{ ceph_fsid }} /etc/ceph/monmap
+      args:
+        creates: /etc/ceph/monmap
+
+
+###############################################################################
+# Distribute ceph.conf + keyrings + monmap
+###############################################################################
+- name: Distribute ceph.conf + keyrings + monmap
+  hosts: all
+  become: yes
+  gather_facts: false
+
+  vars:
+    admin_host: "{{ groups['admin'][0] }}"
+
+  tasks:
+    - name: Ensure Ceph directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: ceph
+        group: ceph
+        mode: "0755"
+      loop:
+        - /etc/ceph
+        - /var/lib/ceph/bootstrap-osd
+        - /var/lib/ceph/bootstrap-rgw
+        - /var/lib/ceph/bootstrap-mds
+
+    - name: Slurp ceph.conf from admin
+      slurp:
+        src: /etc/ceph/ceph.conf
+      delegate_to: "{{ admin_host }}"
+      run_once: true
+      register: slurp_ceph_conf
+
+    - name: Install ceph.conf
+      copy:
+        dest: /etc/ceph/ceph.conf
+        content: "{{ slurp_ceph_conf.content | b64decode }}"
+        owner: ceph
+        group: ceph
+        mode: "0644"
+
+    - name: Slurp admin keyring from admin
+      slurp:
+        src: /etc/ceph/ceph.client.admin.keyring
+      delegate_to: "{{ admin_host }}"
+      run_once: true
+      register: slurp_admin_keyring
+
+    - name: Install admin keyring
+      copy:
+        dest: /etc/ceph/ceph.client.admin.keyring
+        content: "{{ slurp_admin_keyring.content | b64decode }}"
+        owner: ceph
+        group: ceph
+        mode: "0600"
+
+    - name: Slurp bootstrap-osd keyring from admin
+      slurp:
+        src: /var/lib/ceph/bootstrap-osd/ceph.keyring
+      delegate_to: "{{ admin_host }}"
+      run_once: true
+      register: slurp_bootstrap_keyring
+
+    - name: Install bootstrap-osd keyring
+      copy:
+        dest: /var/lib/ceph/bootstrap-osd/ceph.keyring
+        content: "{{ slurp_bootstrap_keyring.content | b64decode }}"
+        owner: ceph
+        group: ceph
+        mode: "0600"
+
+    - name: Slurp bootstrap-rgw keyring from admin
+      slurp:
+        src: /var/lib/ceph/bootstrap-rgw/ceph.keyring
+      delegate_to: "{{ admin_host }}"
+      run_once: true
+      register: slurp_bootstrap_rgw_keyring
+
+    - name: Install bootstrap-rgw keyring
+      copy:
+        dest: /var/lib/ceph/bootstrap-rgw/ceph.keyring
+        content: "{{ slurp_bootstrap_rgw_keyring.content | b64decode }}"
+        owner: ceph
+        group: ceph
+        mode: "0600"
+
+    - name: Slurp bootstrap-mds keyring from admin
+      slurp:
+        src: /var/lib/ceph/bootstrap-mds/ceph.keyring
+      delegate_to: "{{ admin_host }}"
+      run_once: true
+      register: slurp_bootstrap_mds_keyring
+
+    - name: Install bootstrap-mds keyring
+      copy:
+        dest: /var/lib/ceph/bootstrap-mds/ceph.keyring
+        content: "{{ slurp_bootstrap_mds_keyring.content | b64decode }}"
+        owner: ceph
+        group: ceph
+        mode: "0600"
+
+    - name: Slurp monmap from admin
+      slurp:
+        src: /etc/ceph/monmap
+      delegate_to: "{{ admin_host }}"
+      run_once: true
+      register: slurp_monmap
+
+    - name: Install monmap
+      copy:
+        dest: /etc/ceph/monmap
+        content: "{{ slurp_monmap.content | b64decode }}"
+        owner: ceph
+        group: ceph
+        mode: "0644"
+
+    - name: Slurp mon keyring from admin
+      slurp:
+        src: /etc/ceph/ceph.mon.keyring
+      delegate_to: "{{ admin_host }}"
+      run_once: true
+      register: slurp_mon_keyring
+
+    - name: Install mon keyring (for mkfs)
+      copy:
+        dest: /etc/ceph/ceph.mon.keyring
+        content: "{{ slurp_mon_keyring.content | b64decode }}"
+        owner: ceph
+        group: ceph
+        mode: "0600"
+
+
+###############################################################################
+# Initialize and start MONs
+###############################################################################
+- name: Initialize and start MON daemons
+  hosts: mon
+  become: yes
+
+  vars:
+    ceph_cluster_name: ceph
+    mon_name: "{{ inventory_hostname }}"
+
+  tasks:
+    - name: Create MON directory
+      file:
+        path: /var/lib/ceph/mon/{{ ceph_cluster_name }}-{{ mon_name }}
+        state: directory
+        owner: ceph
+        group: ceph
+
+    - name: Initialize MON filesystem
+      command: >
+        ceph-mon --cluster {{ ceph_cluster_name }} --mkfs
+        -i {{ mon_name }}
+        --monmap /etc/ceph/monmap
+        --keyring /etc/ceph/ceph.mon.keyring
+      args:
+        creates: /var/lib/ceph/mon/{{ ceph_cluster_name }}-{{ mon_name }}/store.db
+
+    - name: Fix ownership
+      file:
+        path: /var/lib/ceph
+        owner: ceph
+        group: ceph
+        recurse: yes
+
+    - name: Enable and start MON
+      systemd:
+        name: ceph-mon@{{ mon_name }}
+        enabled: yes
+        state: started
+
+
+###############################################################################
+# Configure and start MGRs
+###############################################################################
+- name: Configure and start MGR daemons
+  hosts: mgr
+  become: yes
+
+  vars:
+    ceph_cluster_name: ceph
+    mgr_name: "{{ inventory_hostname }}"
+    admin_host: "{{ groups['admin'][0] }}"
+
+  tasks:
+    - name: Create MGR directory
+      file:
+        path: /var/lib/ceph/mgr/{{ ceph_cluster_name }}-{{ mgr_name }}
+        state: directory
+        owner: ceph
+        group: ceph
+        mode: "0750"
+
+    - name: Ensure mgr auth exists
+      command: >
+        ceph auth get-or-create mgr.{{ mgr_name }}
+        mon 'allow profile mgr'
+        osd 'allow *'
+        mds 'allow *'
+      delegate_to: "{{ admin_host }}"
+      changed_when: false
+
+    - name: Fetch mgr key only
+      command: ceph auth get-key mgr.{{ mgr_name }}
+      delegate_to: "{{ admin_host }}"
+      register: mgr_key_out
+      changed_when: false
+
+    - name: Create canonical mgr keyring
+      command: >
+        ceph-authtool
+        --create-keyring /var/lib/ceph/mgr/{{ ceph_cluster_name }}-{{ mgr_name }}/keyring
+        --name mgr.{{ mgr_name }}
+        --add-key {{ mgr_key_out.stdout | trim }}
+        --cap mon "allow profile mgr"
+        --cap osd "allow *"
+        --cap mds "allow *"
+      args:
+        creates: /var/lib/ceph/mgr/{{ ceph_cluster_name }}-{{ mgr_name }}/keyring
+
+    - name: Fix mgr keyring ownership
+      file:
+        path: /var/lib/ceph/mgr/{{ ceph_cluster_name }}-{{ mgr_name }}/keyring
+        owner: ceph
+        group: ceph
+        mode: "0600"
+
+    - name: Enable and start MGR
+      systemd:
+        name: ceph-mgr@{{ mgr_name }}
+        enabled: yes
+        state: started
+
+
+###############################################################################
+# Configure and start MDS daemons (CephFS)
+###############################################################################
+- name: Configure and start MDS daemons
+  hosts: mds
+  become: yes
+  gather_facts: true
+
+  vars:
+    ceph_cluster_name: ceph
+    mds_name: "{{ inventory_hostname }}"
+    admin_host: "{{ groups['admin'][0] }}"
+
+  tasks:
+    - name: Create MDS directory
+      file:
+        path: /var/lib/ceph/mds/{{ ceph_cluster_name }}-{{ mds_name }}
+        state: directory
+        owner: ceph
+        group: ceph
+        mode: "0750"
+
+    - name: Ensure MDS auth exists
+      command: >
+        ceph auth get-or-create mds.{{ mds_name }}
+        mon 'allow profile mds'
+        osd 'allow rwx'
+        mds 'allow'
+      delegate_to: "{{ admin_host }}"
+      changed_when: false
+
+    - name: Fetch MDS key only
+      command: ceph auth get-key mds.{{ mds_name }}
+      delegate_to: "{{ admin_host }}"
+      register: mds_key_out
+      changed_when: false
+
+    - name: Create canonical MDS keyring
+      command: >
+        ceph-authtool
+        --create-keyring /var/lib/ceph/mds/{{ ceph_cluster_name }}-{{ mds_name }}/keyring
+        --name mds.{{ mds_name }}
+        --add-key {{ mds_key_out.stdout | trim }}
+        --cap mon "allow profile mds"
+        --cap osd "allow rwx"
+        --cap mds "allow"
+      args:
+        creates: /var/lib/ceph/mds/{{ ceph_cluster_name }}-{{ mds_name }}/keyring
+
+    - name: Fix MDS keyring ownership
+      file:
+        path: /var/lib/ceph/mds/{{ ceph_cluster_name }}-{{ mds_name }}/keyring
+        owner: ceph
+        group: ceph
+        mode: "0600"
+
+    - name: Enable and start MDS
+      systemd:
+        name: ceph-mds@{{ mds_name }}
+        enabled: yes
+        state: started
+
+
+###############################################################################
+# Post-bootstrap changes + create CephFS volume (run on admin)
+###############################################################################
+- name: Post-bootstrap hardening, mgr module cleanup, and create CephFS
+  hosts: admin
+  become: yes
+  gather_facts: false
+
+  vars:
+    mgr_enable_modules:
+      - prometheus
+      - pg_autoscaler
+      - balancer
+      - crash
+      - status
+      - devicehealth
+      - telemetry
+
+    # CephFS defaults (override as needed)
+    cephfs_name: cephfs
+    cephfs_metadata_pool: cephfs_metadata
+    cephfs_data_pool: cephfs_data
+    cephfs_pg_num: 8
+
+  tasks:
+    - name: Wait for ceph CLI to respond
+      command: ceph -s
+      register: ceph_s
+      retries: 30
+      delay: 2
+      until: ceph_s.rc == 0
+      changed_when: false
+
+    - name: Enable msgr2 on all monitors
+      command: ceph mon enable-msgr2
+      changed_when: false
+
+    - name: Disable insecure global_id reclaim
+      command: ceph config set mon auth_allow_insecure_global_id_reclaim false
+      changed_when: false
+
+    - name: Enable commonly useful mgr modules
+      command: "ceph mgr module enable {{ item }}"
+      loop: "{{ mgr_enable_modules }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Create CephFS pools (idempotent)
+      command: "ceph osd pool create {{ item }} {{ cephfs_pg_num }}"
+      loop:
+        - "{{ cephfs_metadata_pool }}"
+        - "{{ cephfs_data_pool }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Enable application cephfs on pools
+      command: "ceph osd pool application enable {{ item }} cephfs"
+      loop:
+        - "{{ cephfs_metadata_pool }}"
+        - "{{ cephfs_data_pool }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Create CephFS filesystem (idempotent)
+      command: "ceph fs new {{ cephfs_name }} {{ cephfs_metadata_pool }} {{ cephfs_data_pool }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Ensure at least 1 active MDS
+      command: "ceph fs set {{ cephfs_name }} max_mds 1"
+      failed_when: false
+      changed_when: false
+
+
+###############################################################################
+# Create LVM backed OSDs on all declared disks
+###############################################################################
+- name: Create OSDs
+  hosts: osd
+  become: yes
+  gather_facts: false
+
+  vars:
+    disks: "{{ osd_disks | default(['/dev/sdb']) }}"
+
+  tasks:
+    - name: Validate disks list is not empty
+      fail:
+        msg: "No OSD disks defined for {{ inventory_hostname }}"
+      when: disks | length == 0
+
+    - name: Verify each target disk exists
+      stat:
+        path: "{{ item }}"
+      loop: "{{ disks }}"
+      register: disk_stats
+
+    - name: Fail if any disk is missing
+      fail:
+        msg: "OSD disk {{ item.item }} does not exist on {{ inventory_hostname }}"
+      when: not item.stat.exists
+      loop: "{{ disk_stats.results }}"
+
+    - name: Refuse mounted disks
+      shell: "findmnt -n {{ item }} >/dev/null 2>&1"
+      loop: "{{ disks }}"
+      register: mounted_check
+      failed_when: false
+      changed_when: false
+
+    - name: Fail if disk appears mounted
+      fail:
+        msg: "OSD disk {{ item.item }} is mounted on {{ inventory_hostname }}"
+      when: item.rc == 0
+      loop: "{{ mounted_check.results }}"
+
+    - name: Check if ceph-volume already configured disk
+      shell: "ceph-volume lvm list 2>/dev/null | grep -F '{{ item }}' -q"
+      loop: "{{ disks }}"
+      register: cephvol_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create OSDs using ceph-volume (Bluestore LVM)
+      command: "ceph-volume lvm create --data {{ item.item }}"
+      loop: "{{ cephvol_check.results }}"
+      when: item.rc != 0
+
+    - name: Show OSD summary on this host
+      command: ceph-volume lvm list
+      register: osd_list
+      changed_when: false
+
+    - debug:
+        var: osd_list.stdout
+
+
+###############################################################################
+# Configure and start RGW daemons
+###############################################################################
+- name: Configure and start RGW daemons
+  hosts: rgw
+  become: yes
+  gather_facts: true
+
+  vars:
+    ceph_cluster_name: ceph
+    rgw_name: "{{ inventory_hostname }}"
+    admin_host: "{{ groups['admin'][0] }}"
+    rgw_frontend_port: 80
+
+  tasks:
+    - name: Create RGW directory
+      file:
+        path: /var/lib/ceph/radosgw/{{ ceph_cluster_name }}-rgw.{{ rgw_name }}
+        state: directory
+        owner: ceph
+        group: ceph
+        mode: "0750"
+
+    - name: Ensure RGW auth exists
+      command: >
+        ceph auth get-or-create client.rgw.{{ rgw_name }}
+        mon 'allow rw'
+        osd 'allow rwx'
+        mgr 'allow r'
+      delegate_to: "{{ admin_host }}"
+      changed_when: false
+
+    - name: Fetch RGW key only
+      command: ceph auth get-key client.rgw.{{ rgw_name }}
+      delegate_to: "{{ admin_host }}"
+      register: rgw_key_out
+      changed_when: false
+
+    - name: Create canonical RGW keyring
+      command: >
+        ceph-authtool
+        --create-keyring /var/lib/ceph/radosgw/{{ ceph_cluster_name }}-rgw.{{ rgw_name }}/keyring
+        --name client.rgw.{{ rgw_name }}
+        --add-key {{ rgw_key_out.stdout | trim }}
+        --cap mon "allow rw"
+        --cap osd "allow rwx"
+        --cap mgr "allow r"
+      args:
+        creates: /var/lib/ceph/radosgw/{{ ceph_cluster_name }}-rgw.{{ rgw_name }}/keyring
+
+    - name: Fix RGW keyring ownership/mode
+      file:
+        path: /var/lib/ceph/radosgw/{{ ceph_cluster_name }}-rgw.{{ rgw_name }}/keyring
+        owner: ceph
+        group: ceph
+        mode: "0600"
+
+    - name: Enable and start RGW
+      systemd:
+        name: ceph-radosgw@rgw.{{ rgw_name }}
+        enabled: yes
+        state: started
+
+
+###############################################################################
+# Verify cluster
+###############################################################################
+- name: Verify Ceph cluster
+  hosts: admin
+  become: yes
+  gather_facts: false
+
+  tasks:
+    - command: ceph -s
+      register: ceph_status
+      changed_when: false
+
+    - debug:
+        var: ceph_status.stdout
+

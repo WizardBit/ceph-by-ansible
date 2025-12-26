@@ -1,0 +1,34 @@
+[all]
+%{ for i in mons ~}
+${i.name} ansible_host=${i.name}.${domain} ansible_connection=ssh ansible_ssh_common_args="-o StrictHostKeyChecking=no" ansible_user=${ansible_user}
+%{ endfor ~}
+%{ for i in osds ~}
+${i.name} ansible_host=${i.name}.${domain} ansible_connection=ssh ansible_ssh_common_args="-o StrictHostKeyChecking=no" ansible_user=${ansible_user}
+%{ endfor ~}
+
+[admin]
+${mons[0].name}
+
+[mon]
+%{ for i in mons ~}
+${i.name}
+%{ endfor ~}
+
+[mgr]
+%{ for i in mons ~}
+${i.name}
+%{ endfor ~}
+
+[mds]
+%{ for i in mons ~}
+${i.name}
+%{ endfor ~}
+
+[osd]
+%{ for i in osds ~}
+${i.name} osd_disks='["${osd_1_device}", "${osd_2_device}"]'
+%{ endfor ~}
+
+[rgw]
+${mons[0].name}
+
