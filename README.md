@@ -104,7 +104,7 @@ sudo apt-get update; sudo apt-get -y install ansible opentofu
 openstack image set --property hw_disk_bus='scsi' --property hw_scsi_model='virtio-scsi' <image-name-here>
 ```
 
-In order to be able to use the OpenStack provider, create the required granular application credential using the following command:
+In order to be able to use the OpenStack provider, you need an existing `openrc` or `clouds.yaml` file. Alternatively create a granular application credential using the following command:
 
 ```
 openstack application credential create tf-app-cred \
