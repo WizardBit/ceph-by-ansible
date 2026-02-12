@@ -20,6 +20,7 @@ data "openstack_compute_keypair_v2" "kp" {
 }
 
 data "openstack_dns_zone_v2" "zone" {
+  count = var.openstack_designate ? 1 : 0
   name = var.openstack_domain
 }
 
@@ -83,9 +84,9 @@ resource "openstack_compute_instance_v2" "node" {
 # DNS A records for each instance
 ###############################################################################
 resource "openstack_dns_recordset_v2" "a" {
-  for_each = openstack_compute_instance_v2.node
+  for_each = var.openstack_designate ? openstack_compute_instance_v2.node : {}
 
-  zone_id = data.openstack_dns_zone_v2.zone.id
+  zone_id = data.openstack_dns_zone_v2.zone[0].id
   name    = "${each.key}.${var.openstack_domain}"
   type    = "A"
   ttl     = 300
@@ -102,7 +103,7 @@ resource "openstack_blockstorage_volume_v3" "osd_data" {
 
   name              = each.key
   size              = var.osd_size
-  volume_type       = "nvme"
+  volume_type       = "Ceph_NVMe"
   availability_zone = var.openstack_az
 }
 
@@ -165,4 +166,3 @@ resource "null_resource" "run_ansible" {
     EOT
   }
 }
-

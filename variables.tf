@@ -10,7 +10,7 @@ variable "osd_count" {
 
 variable "osd_size" {
   type    = number
-  default = 500
+  default = 50
 }
 
 variable "osd_1_device" {
@@ -23,6 +23,11 @@ variable "osd_2_device" {
   default = "/dev/sdc"
 }
 
+variable "openstack_designate" {
+  type    = bool
+  default = false
+}
+
 variable "openstack_domain" {
   type    = string
   default = "hrizn.lab." # keep trailing dot
@@ -30,22 +35,22 @@ variable "openstack_domain" {
 
 variable "openstack_image" {
   type    = string
-  default = "Ubuntu-24.04-LTS"
+  default = "noble-ceph-ansible"
 }
 
 variable "openstack_flavor" {
   type    = string
-  default = "m1.medium"
+  default = "staging-cpu4-ram8-disk50"
 }
 
 variable "openstack_net" {
   type    = string
-  default = "vlan-3"
+  default = "net_$OS_USERNAME-pse"
 }
 
 variable "openstack_az" {
   type    = string
-  default = "az1"
+  default = "availability-zone-1"
 }
 
 variable "root_size" {
@@ -55,12 +60,12 @@ variable "root_size" {
 
 variable "openstack_security_group" {
   type    = string
-  default = "Allow-All-Traffic"
+  default = "default"
 }
 
 variable "openstack_ssh_keypair" {
   type    = string
-  default = "alan-veloci"
+  default = "lpkey"
 }
 
 variable "mons" {
