@@ -21,13 +21,13 @@ data "openstack_compute_keypair_v2" "kp" {
 
 data "openstack_dns_zone_v2" "zone" {
   count = var.openstack_designate ? 1 : 0
-  name = var.openstack_domain
+  name  = var.openstack_domain
 }
 
 locals {
   all_nodes = concat(var.mons, var.osds)
-  mons = [for n in var.mons : openstack_compute_instance_v2.node[n]]
-  osds = [for n in var.osds : openstack_compute_instance_v2.node[n]]
+  mons      = [for n in var.mons : openstack_compute_instance_v2.node[n]]
+  osds      = [for n in var.osds : openstack_compute_instance_v2.node[n]]
 
   osd_volume_pairs = flatten([
     for host in var.osds : [
@@ -41,9 +41,9 @@ locals {
 
   inventory_ini = templatefile("${path.module}/ansible/inventory.ini.tmpl", {
     ansible_user = var.ansible_user
-    domain = var.openstack_domain
-    mons = local.mons
-    osds = local.osds
+    domain       = var.openstack_domain
+    mons         = local.mons
+    osds         = local.osds
     osd_1_device = var.osd_1_device
     osd_2_device = var.osd_2_device
   })
@@ -91,7 +91,7 @@ resource "openstack_dns_recordset_v2" "a" {
   type    = "A"
   ttl     = 300
 
-  records = [each.value.access_ip_v4 != "" ? each.value.access_ip_v4 : each.value.network[0].fixed_ip_v4]
+  records    = [each.value.access_ip_v4 != "" ? each.value.access_ip_v4 : each.value.network[0].fixed_ip_v4]
   depends_on = [openstack_compute_instance_v2.node]
 }
 
@@ -148,9 +148,9 @@ resource "null_resource" "run_ansible" {
 
   provisioner "local-exec" {
     environment = {
-      ANSIBLE_FORCE_COLOR = "1"
+      ANSIBLE_FORCE_COLOR     = "1"
       ANSIBLE_STDOUT_CALLBACK = "yaml"
-      PYTHONUNBUFFERED = "1"
+      PYTHONUNBUFFERED        = "1"
     }
 
     command = <<EOT
