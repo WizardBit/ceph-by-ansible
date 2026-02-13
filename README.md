@@ -82,6 +82,7 @@ osd-3 osd_disks='["/dev/sdb","/dev/sdc"]'
 [rgw]
 mon-1
 ```
+
 ```
 ansible-playbook ansible/ceph-playbook.yml -i <inventory-file-name-here> -u ${ssh_user}
 ```
@@ -100,8 +101,19 @@ sudo apt-get update; sudo apt-get -y install ansible opentofu
 
 - **Note**: Use SCSI bus if want OSD disk names to be /dev/sd* (see the `variables.tf` file). Use the following command to update existing images:
 
+Using an existing image
+
 ```
 openstack image set --property hw_disk_bus='scsi' --property hw_scsi_model='virtio-scsi' <image-name-here>
+```
+
+Creating a new image
+
+```
+wget https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
+
+openstack image create --container-format bare --disk-format qcow2 --property hw_disk_bus='scsi' /
+  --property hw_scsi_model='virtio-scsi' --file ubuntu-24.04-server-cloudimg-amd64.img noble-ceph-ansible
 ```
 
 In order to be able to use the OpenStack provider, you need an existing `openrc` or `clouds.yaml` file. Alternatively create a granular application credential using the following command:
@@ -163,6 +175,8 @@ openstack endpoint list --service identity --interface public -f value -c URL -c
 ```
 
 ## Deploy
+
+Supply `openrc`, `cloud.yaml`, or application credential as mentioned above.
 
 Use the following commands to start a deployment. Adjust the SSH user (ansible_user) and the desired OpenStack image name (See `variables.tf` for details):
 
