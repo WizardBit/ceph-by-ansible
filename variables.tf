@@ -45,7 +45,7 @@ variable "openstack_flavor" {
 
 variable "openstack_net" {
   type    = string
-  default = "net_$OS_USERNAME-pse"
+  default = "net-pse"
 }
 
 variable "openstack_az" {
