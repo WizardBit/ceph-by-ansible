@@ -13,6 +13,11 @@ variable "osd_size" {
   default = 50
 }
 
+variable "volume_type" {
+  type = string
+  default = "Ceph_NVMe"
+}
+
 variable "osd_1_device" {
   type    = string
   default = "/dev/sdb"

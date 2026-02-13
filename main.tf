@@ -104,7 +104,7 @@ resource "openstack_blockstorage_volume_v3" "osd_data" {
 
   name              = each.key
   size              = var.osd_size
-  volume_type       = "Ceph_NVMe"
+  volume_type       = var.volume_type
   availability_zone = var.openstack_az
 }
 
