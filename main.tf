@@ -40,12 +40,13 @@ locals {
   ])
 
   inventory_ini = templatefile("${path.module}/ansible/inventory.ini.tmpl", {
-    ansible_user = var.ansible_user
-    domain       = var.openstack_domain
-    mons         = local.mons
-    osds         = local.osds
-    osd_1_device = var.osd_1_device
-    osd_2_device = var.osd_2_device
+    ansible_user        = var.ansible_user
+    domain              = var.openstack_domain
+    openstack_designate = var.openstack_designate
+    mons                = local.mons
+    osds                = local.osds
+    osd_1_device        = var.osd_1_device
+    osd_2_device        = var.osd_2_device
   })
 }
 

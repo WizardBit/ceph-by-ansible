@@ -1,9 +1,13 @@
 [all]
 %{ for i in mons ~}
-${i.name} ansible_host=${i.name}.${domain} ansible_connection=ssh ansible_ssh_common_args="-o StrictHostKeyChecking=no" ansible_user=${ansible_user}
+${i.name} ansible_host=${
+  openstack_designate ? "${i.name}.${domain}" : i.network[0].fixed_ip_v4 }
+  ansible_connection=ssh ansible_user=${ansible_user}
 %{ endfor ~}
 %{ for i in osds ~}
-${i.name} ansible_host=${i.name}.${domain} ansible_connection=ssh ansible_ssh_common_args="-o StrictHostKeyChecking=no" ansible_user=${ansible_user}
+${i.name} ansible_host=${
+  openstack_designate ? "${i.name}.${domain}" : i.network[0].fixed_ip_v4 }
+  ansible_connection=ssh ansible_user=${ansible_user}
 %{ endfor ~}
 
 [admin]
